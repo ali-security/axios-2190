@@ -271,10 +271,29 @@
         </td>
         <td align="center" width="33.333333333333336%">
             <a
-                href="https://opencollective.com/axios/contribute"
+                href="https://global.fun88.com/?utm_source=axios_docs_website&utm_medium=website&utm_campaign=axios_open_collective_sponsorship"
+                style="padding: 10px; display: inline-block"
                 target="_blank"
-                >💜 Become a sponsor</a
             >
+                <img
+                    width="71px"
+                    height="70px"
+                    src="https://images.opencollective.com/fun88-official/bf2843c/logo.png"
+                    alt="Fun 88"
+                />
+            </a>
+            <p
+                align="center"
+            >
+                Fun88 is a global online gambling and betting brand founded in 2009, offering a wide range of services including sports betting, live casino games, slots, and virtual gaming.
+            </p>
+            <p align="center">
+                <a
+                    href="https://global.fun88.com/?utm_source=axios_docs_website&utm_medium=website&utm_campaign=axios_open_collective_sponsorship"
+                    target="_blank"
+                    ><b>global.fun88.com</b></a
+                >
+            </p>
         </td>
     </tr>
 </table>
