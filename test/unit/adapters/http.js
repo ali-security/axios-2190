@@ -2,6 +2,11 @@ var axios = require("../../../index");
 var http = require("http");
 var https = require("https");
 var net = require("net");
+// Pre-load `dns` so it isn't lazy-required from inside an http request
+// after a test pollutes `Object.prototype.get` — on older Node versions
+// the lazy `Object.defineProperty` call in dns.js inherits the polluted
+// getter and throws "Getter must be a function".
+require("dns");
 var url = require("url");
 var zlib = require("zlib");
 var assert = require("assert");
@@ -20,6 +25,18 @@ var isBlobSupported = typeof Blob !== "undefined";
 var noop = () => {};
 
 describe("supports http with nodejs", function () {
+  function clearPrototypePollution() {
+    delete Object.prototype.auth;
+    delete Object.prototype.username;
+    delete Object.prototype.password;
+    delete Object.prototype.common;
+    delete Object.prototype.get;
+    delete Object.prototype.post;
+  }
+
+  // Defensive: clear before each test in case another suite left pollution.
+  beforeEach(clearPrototypePollution);
+
   afterEach(function () {
     if (server) {
       server.close();
@@ -34,6 +51,7 @@ describe("supports http with nodejs", function () {
     delete process.env.https_proxy;
     delete process.env.no_proxy;
     delete process.env.NO_PROXY;
+    clearPrototypePollution();
   });
 
   it("should sanitize request headers containing invalid characters", function (done) {
@@ -384,11 +402,11 @@ describe("supports http with nodejs", function () {
           .createServer(function (request, response) {
             proxyUseCount += 1;
             var parsed = url.parse(request.url);
-            var opts = {
-              host: parsed.hostname,
-              port: parsed.port,
-              path: parsed.path,
-            };
+            var opts = Object.create(null);
+            opts.host = parsed.hostname;
+            opts.port = parsed.port;
+            opts.path = parsed.path;
+            opts.auth = undefined;
 
             http.get(opts, function (res) {
               response.writeHead(res.statusCode, res.headers);
@@ -424,6 +442,163 @@ describe("supports http with nodejs", function () {
                   proxyUseCount,
                   "should go through proxy on every redirect",
                 );
+                done();
+              })
+              .catch(done);
+          });
+      });
+  });
+
+  it("should remove proxy authorization when redirect switches from authenticated HTTP proxy to direct HTTPS", function (done) {
+    var proxyAuth =
+      "Basic " + Buffer.from("user:pass", "utf8").toString("base64");
+    var proxyRequestAuth;
+
+    proxy = http
+      .createServer(function (request, response) {
+        proxyRequestAuth = request.headers["proxy-authorization"];
+        response.setHeader("Location", "https://localhost:1/");
+        response.statusCode = 302;
+        response.end();
+      })
+      .listen(4000, function () {
+        process.env.HTTP_PROXY = "http://user:pass@localhost:4000/";
+
+        axios
+          .get("http://example.com/", {
+            headers: {
+              "proxy-authorization": "Basic stale",
+            },
+            maxRedirects: 1,
+            beforeRedirect: function (options) {
+              assert.equal(proxyRequestAuth, proxyAuth);
+              assert.equal(options.headers["Proxy-Authorization"], undefined);
+              assert.equal(options.headers["proxy-authorization"], undefined);
+              throw new Error("stop before direct redirect");
+            },
+          })
+          .then(function () {
+            done(new Error("request should not succeed"));
+          })
+          .catch(function (error) {
+            assert.equal(
+              error.message,
+              "Redirected request failed: stop before direct redirect",
+            );
+            done();
+          });
+      });
+  });
+
+  it("should remove proxy authorization when redirected target is excluded by no_proxy", function (done) {
+    proxy = http
+      .createServer(function (request, response) {
+        response.setHeader("Location", "http://localhost:1/");
+        response.statusCode = 302;
+        response.end();
+      })
+      .listen(4000, function () {
+        process.env.HTTP_PROXY = "http://user:pass@localhost:4000/";
+        process.env.NO_PROXY = "localhost";
+
+        axios
+          .get("http://example.com/", {
+            maxRedirects: 1,
+            beforeRedirect: function (options) {
+              assert.equal(options.headers["Proxy-Authorization"], undefined);
+              assert.equal(options.headers["proxy-authorization"], undefined);
+              throw new Error("stop before no_proxy redirect");
+            },
+          })
+          .then(function () {
+            done(new Error("request should not succeed"));
+          })
+          .catch(function (error) {
+            assert.equal(
+              error.message,
+              "Redirected request failed: stop before no_proxy redirect",
+            );
+            done();
+          });
+      });
+  });
+
+  it("should remove proxy authorization case-insensitively when no proxy applies", function (done) {
+    server = http
+      .createServer(function (req, res) {
+        assert.equal(req.headers["proxy-authorization"], undefined);
+        res.end("ok");
+      })
+      .listen(4444, function () {
+        process.env.HTTP_PROXY = "http://localhost:4000/";
+        process.env.NO_PROXY = "localhost";
+
+        axios
+          .get("http://localhost:4444/", {
+            headers: {
+              "pRoXy-AuThOrIzAtIoN": "Basic stale",
+            },
+          })
+          .then(function (res) {
+            assert.equal(res.data, "ok");
+            done();
+          })
+          .catch(done);
+      });
+  });
+
+  it("should keep proxy authorization when redirected request still uses authenticated proxy", function (done) {
+    var requestCount = 0;
+    var proxyAuth =
+      "Basic " + Buffer.from("user:pass", "utf8").toString("base64");
+
+    server = http
+      .createServer(function (req, res) {
+        requestCount += 1;
+        if (requestCount === 1) {
+          res.setHeader("Location", "http://localhost:4444/final");
+          res.statusCode = 302;
+        }
+        res.end("ok");
+      })
+      .listen(4444, function () {
+        var proxyUseCount = 0;
+
+        proxy = http
+          .createServer(function (request, response) {
+            proxyUseCount += 1;
+            assert.equal(request.headers["proxy-authorization"], proxyAuth);
+
+            var parsed = url.parse(request.url);
+            var opts = {
+              host: parsed.hostname,
+              port: parsed.port,
+              path: parsed.path,
+            };
+
+            http.get(opts, function (res) {
+              response.writeHead(res.statusCode, res.headers);
+              res.on("data", function (data) {
+                response.write(data);
+              });
+              res.on("end", function () {
+                response.end();
+              });
+            });
+          })
+          .listen(4000, function () {
+            axios
+              .get("http://localhost:4444/", {
+                proxy: {
+                  host: "localhost",
+                  port: 4000,
+                  auth: "user:pass",
+                },
+                maxRedirects: 1,
+              })
+              .then(function (res) {
+                assert.equal(res.data, "ok");
+                assert.equal(proxyUseCount, 2);
                 done();
               })
               .catch(done);
@@ -1390,11 +1565,11 @@ describe("supports http with nodejs", function () {
         proxy = http
           .createServer(function (request, response) {
             var parsed = url.parse(request.url);
-            var opts = {
-              host: parsed.hostname,
-              port: parsed.port,
-              path: parsed.path,
-            };
+            var opts = Object.create(null);
+            opts.host = parsed.hostname;
+            opts.port = parsed.port;
+            opts.path = parsed.path;
+            opts.auth = undefined;
 
             http.get(opts, function (res) {
               var body = "";
@@ -1527,6 +1702,119 @@ describe("supports http with nodejs", function () {
               })
               .catch(done);
           });
+      });
+  });
+
+  it("should not use inherited proxy auth credentials", function (done) {
+    Object.prototype.auth = {};
+    Object.prototype.username = "polluted-user";
+    Object.prototype.password = "polluted-pass";
+
+    server = http
+      .createServer(function (req, res) {
+        res.end();
+      })
+      .listen(4444, function () {
+        proxy = http
+          .createServer(function (request, response) {
+            var parsed = url.parse(request.url);
+            var opts = Object.create(null);
+            opts.host = parsed.hostname;
+            opts.port = parsed.port;
+            opts.path = parsed.path;
+            opts.auth = undefined;
+            var proxyAuth = request.headers["proxy-authorization"];
+
+            http.get(opts, function (res) {
+              res.on("data", function () {});
+              res.on("end", function () {
+                response.setHeader("Content-Type", "text/html; charset=UTF-8");
+                response.end(proxyAuth || "");
+              });
+            });
+          })
+          .listen(4000, function () {
+            axios
+              .get("http://localhost:4444/", {
+                proxy: {
+                  host: "localhost",
+                  port: 4000,
+                },
+              })
+              .then(function (res) {
+                assert.equal(res.data, "");
+                done();
+              })
+              .catch(done);
+          });
+      });
+  });
+
+  it("should not send inherited header buckets on GET requests", function (done) {
+    var inheritedHeaderBuckets = Object.create(null);
+    inheritedHeaderBuckets.common = { "x-polluted-common": "yes" };
+    inheritedHeaderBuckets.get = { "x-polluted-get": "yes" };
+
+    server = http
+      .createServer(function (req, res) {
+        assert.strictEqual(req.headers["x-polluted-common"], undefined);
+        assert.strictEqual(req.headers["x-polluted-get"], undefined);
+        assert.strictEqual(req.headers["x-request"], "request");
+        res.end("ok");
+      })
+      .listen(4444, function () {
+        var requestHeaders = Object.create(inheritedHeaderBuckets);
+        requestHeaders["x-request"] = "request";
+
+        axios
+          .get("http://localhost:4444/", {
+            headers: requestHeaders,
+          })
+          .then(function () {
+            done();
+          })
+          .catch(done);
+      });
+  });
+
+  it("should not send inherited header buckets on requests with a body", function (done) {
+    server = http
+      .createServer(function (req, res) {
+        assert.strictEqual(req.headers["x-polluted-common"], undefined);
+        assert.strictEqual(req.headers["x-polluted-post"], undefined);
+        assert.strictEqual(req.headers["x-own-common"], "default");
+        assert.strictEqual(req.headers["x-own-post"], "method");
+        assert.strictEqual(req.headers["x-request"], "request");
+        req.on("data", function () {});
+        req.on("end", function () {
+          res.end("ok");
+        });
+      })
+      .listen(4444, function () {
+        Object.prototype.common = { "x-polluted-common": "yes" };
+        Object.prototype.post = { "x-polluted-post": "yes" };
+
+        var instance = axios.create({
+          headers: {
+            common: {
+              "x-own-common": "default",
+            },
+            post: {
+              "x-own-post": "method",
+            },
+          },
+        });
+
+        instance
+          .post("http://localhost:4444/", "body", {
+            headers: {
+              "x-request": "request",
+            },
+          })
+          .then(function () {
+            done();
+          })
+          .catch(done);
       });
   });
 
